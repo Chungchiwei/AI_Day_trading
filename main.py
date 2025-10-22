@@ -23,7 +23,7 @@ def get_api_key(key_name):
 
 # 設定 API 金鑰
 os.environ['PERPLEXITY_API_KEY'] = get_api_key('PERPLEXITY_API_KEY') or ''
-os.environ['FINMIND_API_KEY'] = get_api_key('FINMIND_API_KEY') or ''
+os.environ['FINMIND_TOKEN'] = get_api_key('FINMIND_TOKEN') or ''
 
 # 檢查必要的 API 金鑰
 if not os.environ.get('PERPLEXITY_API_KEY'):
