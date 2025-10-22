@@ -12,6 +12,25 @@ load_dotenv()
 FINMIND_TOKEN = os.getenv("FINMIND_TOKEN")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 
+# ✅ 新增：支援 Streamlit Cloud secrets
+def get_api_key(key_name):
+    """獲取 API 金鑰（支援本地 .env 和 Streamlit Cloud secrets）"""
+    # 優先使用 Streamlit secrets
+    if hasattr(st, 'secrets') and key_name in st.secrets:
+        return st.secrets[key_name]
+    # 其次使用環境變數
+    return os.getenv(key_name)
+
+# 設定 API 金鑰
+os.environ['PERPLEXITY_API_KEY'] = get_api_key('PERPLEXITY_API_KEY') or ''
+os.environ['FINMIND_API_KEY'] = get_api_key('FINMIND_API_KEY') or ''
+
+# 檢查必要的 API 金鑰
+if not os.environ.get('PERPLEXITY_API_KEY'):
+    st.error("❌ 未設定 APERPLEXITY_API_KEY")
+    st.info("請在 Streamlit Cloud 的 Settings → Secrets 中設定 API 金鑰")
+    st.stop()
+    
 # 導入自定義模組
 from modules.data_fetcher import get_stock_data, get_stock_name
 from modules.technical_indicators import (
@@ -24,6 +43,7 @@ from modules.chart_plotter import plot_candlestick_chart, get_signal_summary
 from modules.ai_analyzer import search_news_events, generate_daytrading_analysis
 from modules.utils import validate_inputs, format_currency, calculate_position_size
 from modules.database import get_database
+
 
 # 頁面配置
 st.set_page_config(
