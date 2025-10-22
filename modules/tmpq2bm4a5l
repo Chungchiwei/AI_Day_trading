@@ -1,0 +1,464 @@
+"""
+資料庫模組 - 管理股票數據的本地快取
+"""
+
+import sqlite3
+import pandas as pd
+from datetime import datetime, timedelta
+import os
+
+class StockDatabase:
+    """股票數據資料庫管理類"""
+    
+    def __init__(self, db_path='data/stock_data.db'):
+        """
+        初始化資料庫連接
+        
+        參數:
+            db_path: 資料庫文件路徑
+        """
+        # 確保目錄存在
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        
+        self.db_path = db_path
+        self.conn = None
+        self._connect()
+        self._create_tables()
+    
+    def _connect(self):
+        """建立資料庫連接"""
+        try:
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.conn.execute("PRAGMA journal_mode=WAL")  # 提升並發性能
+            print(f"✅ 資料庫連接成功: {self.db_path}")
+        except Exception as e:
+            print(f"❌ 資料庫連接失敗: {e}")
+            raise
+    
+    def _create_tables(self):
+        """創建必要的數據表"""
+        try:
+            cursor = self.conn.cursor()
+            
+            # 股票價格表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS stock_prices (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    date DATE NOT NULL,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    volume INTEGER,
+                    amount REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(symbol, date)
+                )
+            """)
+            
+            # 三大法人數據表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS institutional_investors (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    date DATE NOT NULL,
+                    foreign_investor REAL,
+                    investment_trust REAL,
+                    dealer REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(symbol, date)
+                )
+            """)
+            
+            # 技術指標表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS technical_indicators (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    date DATE NOT NULL,
+                    indicator_name TEXT NOT NULL,
+                    indicator_value REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(symbol, date, indicator_name)
+                )
+            """)
+            
+            # 創建索引以提升查詢效率
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_stock_prices_symbol_date 
+                ON stock_prices(symbol, date)
+            """)
+            
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_institutional_symbol_date 
+                ON institutional_investors(symbol, date)
+            """)
+            
+            self.conn.commit()
+            print("✅ 資料表創建/檢查完成")
+            
+        except Exception as e:
+            print(f"❌ 創建資料表失敗: {e}")
+            raise
+    
+    def save_stock_data(self, symbol, df):
+        """
+        儲存股票價格數據
+        
+        參數:
+            symbol: 股票代碼
+            df: 包含股票數據的 DataFrame
+        """
+        try:
+            if df is None or df.empty:
+                return
+            
+            # 準備數據
+            df_copy = df.copy()
+            df_copy['symbol'] = symbol
+            df_copy['date'] = pd.to_datetime(df_copy['date']).dt.strftime('%Y-%m-%d')
+            
+            # 選擇需要的欄位
+            columns = ['symbol', 'date', 'open', 'high', 'low', 'close', 'volume', 'amount']
+            df_save = df_copy[columns]
+            
+            # 使用 REPLACE INTO 來處理重複數據
+            df_save.to_sql('stock_prices', self.conn, if_exists='append', index=False, method='multi')
+            
+            # 清理重複數據
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                DELETE FROM stock_prices 
+                WHERE id NOT IN (
+                    SELECT MIN(id) 
+                    FROM stock_prices 
+                    GROUP BY symbol, date
+                )
+            """)
+            
+            self.conn.commit()
+            print(f"✅ 已儲存 {symbol} 的 {len(df_save)} 筆數據到資料庫")
+            
+        except Exception as e:
+            print(f"❌ 儲存股票數據失敗: {e}")
+            self.conn.rollback()
+    
+    def get_stock_data(self, symbol, start_date=None, end_date=None):
+        """
+        讀取股票價格數據
+        
+        參數:
+            symbol: 股票代碼
+            start_date: 開始日期 (YYYY-MM-DD)
+            end_date: 結束日期 (YYYY-MM-DD)
+        
+        返回:
+            DataFrame: 股票數據
+        """
+        try:
+            query = "SELECT * FROM stock_prices WHERE symbol = ?"
+            params = [symbol]
+            
+            if start_date:
+                query += " AND date >= ?"
+                params.append(start_date)
+            
+            if end_date:
+                query += " AND date <= ?"
+                params.append(end_date)
+            
+            query += " ORDER BY date"
+            
+            df = pd.read_sql_query(query, self.conn, params=params)
+            
+            if not df.empty:
+                df['date'] = pd.to_datetime(df['date'])
+            
+            return df
+            
+        except Exception as e:
+            print(f"❌ 讀取股票數據失敗: {e}")
+            return None
+    
+    def save_institutional_data(self, symbol, df):
+        """
+        儲存三大法人數據
+        
+        參數:
+            symbol: 股票代碼
+            df: 包含法人數據的 DataFrame
+        """
+        try:
+            if df is None or df.empty:
+                return
+            
+            # 準備數據
+            df_copy = df.copy()
+            df_copy['symbol'] = symbol
+            df_copy['date'] = pd.to_datetime(df_copy['date']).dt.strftime('%Y-%m-%d')
+            
+            # 重命名欄位以匹配資料庫
+            column_mapping = {
+                'Foreign_Investor': 'foreign_investor',
+                'Investment_Trust': 'investment_trust',
+                'Dealer': 'dealer'
+            }
+            
+            # 只重命名存在的欄位
+            existing_mappings = {k: v for k, v in column_mapping.items() if k in df_copy.columns}
+            if existing_mappings:
+                df_copy = df_copy.rename(columns=existing_mappings)
+            
+            # 選擇需要的欄位（處理可能缺少的欄位）
+            base_columns = ['symbol', 'date']
+            optional_columns = ['foreign_investor', 'investment_trust', 'dealer']
+            
+            # 為缺少的欄位填充 0
+            for col in optional_columns:
+                if col not in df_copy.columns:
+                    df_copy[col] = 0
+            
+            columns = base_columns + optional_columns
+            df_save = df_copy[columns]
+            
+            # 儲存到資料庫
+            df_save.to_sql('institutional_investors', self.conn, if_exists='append', index=False, method='multi')
+            
+            # 清理重複數據
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                DELETE FROM institutional_investors 
+                WHERE id NOT IN (
+                    SELECT MIN(id) 
+                    FROM institutional_investors 
+                    GROUP BY symbol, date
+                )
+            """)
+            
+            self.conn.commit()
+            print(f"✅ 已儲存 {symbol} 的 {len(df_save)} 筆法人數據到資料庫")
+            
+        except Exception as e:
+            print(f"❌ 儲存法人數據失敗: {e}")
+            import traceback
+            print(traceback.format_exc())
+            self.conn.rollback()
+    
+    def get_institutional_data(self, symbol, start_date=None, end_date=None):
+        """
+        讀取三大法人數據
+        
+        參數:
+            symbol: 股票代碼
+            start_date: 開始日期 (YYYY-MM-DD，可選)
+            end_date: 結束日期 (YYYY-MM-DD，可選)
+        
+        返回:
+            DataFrame: 法人數據
+        """
+        try:
+            query = "SELECT * FROM institutional_investors WHERE symbol = ?"
+            params = [symbol]
+            
+            if start_date:
+                query += " AND date >= ?"
+                params.append(start_date)
+            
+            if end_date:
+                query += " AND date <= ?"
+                params.append(end_date)
+            
+            query += " ORDER BY date"
+            
+            df = pd.read_sql_query(query, self.conn, params=params)
+            
+            if not df.empty:
+                df['date'] = pd.to_datetime(df['date'])
+                
+                # 重命名欄位以匹配原始格式
+                df = df.rename(columns={
+                    'foreign_investor': 'Foreign_Investor',
+                    'investment_trust': 'Investment_Trust',
+                    'dealer': 'Dealer'
+                })
+            
+            return df
+            
+        except Exception as e:
+            print(f"❌ 讀取法人數據失敗: {e}")
+            return None
+    
+    def save_technical_indicator(self, symbol, date, indicator_name, indicator_value):
+        """
+        儲存技術指標
+        
+        參數:
+            symbol: 股票代碼
+            date: 日期
+            indicator_name: 指標名稱
+            indicator_value: 指標值
+        """
+        try:
+            cursor = self.conn.cursor()
+            
+            cursor.execute("""
+                INSERT OR REPLACE INTO technical_indicators 
+                (symbol, date, indicator_name, indicator_value)
+                VALUES (?, ?, ?, ?)
+            """, (symbol, date, indicator_name, indicator_value))
+            
+            self.conn.commit()
+            
+        except Exception as e:
+            print(f"❌ 儲存技術指標失敗: {e}")
+            self.conn.rollback()
+    
+    def get_technical_indicators(self, symbol, start_date=None, end_date=None):
+        """
+        讀取技術指標
+        
+        參數:
+            symbol: 股票代碼
+            start_date: 開始日期
+            end_date: 結束日期
+        
+        返回:
+            DataFrame: 技術指標數據
+        """
+        try:
+            query = "SELECT * FROM technical_indicators WHERE symbol = ?"
+            params = [symbol]
+            
+            if start_date:
+                query += " AND date >= ?"
+                params.append(start_date)
+            
+            if end_date:
+                query += " AND date <= ?"
+                params.append(end_date)
+            
+            query += " ORDER BY date, indicator_name"
+            
+            df = pd.read_sql_query(query, self.conn, params=params)
+            
+            if not df.empty:
+                df['date'] = pd.to_datetime(df['date'])
+            
+            return df
+            
+        except Exception as e:
+            print(f"❌ 讀取技術指標失敗: {e}")
+            return None
+    
+    def clear_old_data(self, days=90):
+        """
+        清理舊數據
+        
+        參數:
+            days: 保留最近幾天的數據
+        """
+        try:
+            cutoff_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+            
+            cursor = self.conn.cursor()
+            
+            # 清理舊的股票數據
+            cursor.execute("DELETE FROM stock_prices WHERE date < ?", (cutoff_date,))
+            deleted_prices = cursor.rowcount
+            
+            # 清理舊的法人數據
+            cursor.execute("DELETE FROM institutional_investors WHERE date < ?", (cutoff_date,))
+            deleted_institutional = cursor.rowcount
+            
+            # 清理舊的技術指標
+            cursor.execute("DELETE FROM technical_indicators WHERE date < ?", (cutoff_date,))
+            deleted_indicators = cursor.rowcount
+            
+            self.conn.commit()
+            
+            print(f"✅ 已清理 {cutoff_date} 之前的數據:")
+            print(f"   - 股票價格: {deleted_prices} 筆")
+            print(f"   - 法人數據: {deleted_institutional} 筆")
+            print(f"   - 技術指標: {deleted_indicators} 筆")
+            
+        except Exception as e:
+            print(f"❌ 清理舊數據失敗: {e}")
+            self.conn.rollback()
+    
+    def get_database_stats(self):
+        """
+        獲取資料庫統計信息
+        
+        返回:
+            dict: 統計信息
+        """
+        try:
+            cursor = self.conn.cursor()
+            
+            stats = {}
+            
+            # 股票數據統計
+            cursor.execute("SELECT COUNT(*) FROM stock_prices")
+            stats['stock_prices_count'] = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(DISTINCT symbol) FROM stock_prices")
+            stats['unique_symbols'] = cursor.fetchone()[0]
+            
+            # 法人數據統計
+            cursor.execute("SELECT COUNT(*) FROM institutional_investors")
+            stats['institutional_count'] = cursor.fetchone()[0]
+            
+            # 技術指標統計
+            cursor.execute("SELECT COUNT(*) FROM technical_indicators")
+            stats['indicators_count'] = cursor.fetchone()[0]
+            
+            # 資料庫大小
+            cursor.execute("SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()")
+            stats['database_size_mb'] = cursor.fetchone()[0] / (1024 * 1024)
+            
+            return stats
+            
+        except Exception as e:
+            print(f"❌ 獲取統計信息失敗: {e}")
+            return {}
+    
+    def close(self):
+        """關閉資料庫連接"""
+        if self.conn:
+            self.conn.close()
+            print("✅ 資料庫連接已關閉")
+    
+    def __del__(self):
+        """析構函數，確保連接關閉"""
+        self.close()
+
+
+# 全局資料庫實例
+_db_instance = None
+
+def get_database():
+    """
+    獲取資料庫單例
+    
+    返回:
+        StockDatabase: 資料庫實例
+    """
+    global _db_instance
+    if _db_instance is None:
+        _db_instance = StockDatabase()
+    return _db_instance
+
+
+if __name__ == "__main__":
+    # 測試資料庫功能
+    db = get_database()
+    
+    # 顯示統計信息
+    stats = db.get_database_stats()
+    print("\n📊 資料庫統計:")
+    for key, value in stats.items():
+        print(f"   {key}: {value}")
+    
+    # 測試清理舊數據
+    # db.clear_old_data(days=90)

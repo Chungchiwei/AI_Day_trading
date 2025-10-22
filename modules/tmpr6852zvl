@@ -1,0 +1,264 @@
+"""
+數據獲取模組 - 從 FinMind API 獲取股票數據（整合資料庫快取）
+"""
+
+import requests
+import pandas as pd
+from datetime import datetime, timedelta
+from modules.database import get_database
+
+# ✅ 新增：台股代碼與名稱對應表（常見股票）
+STOCK_NAMES = {
+    "2330": "台積電",
+    "2317": "鴻海",
+    "2454": "聯發科",
+    "2308": "台達電",
+    "2412": "中華電",
+    "2882": "國泰金",
+    "2881": "富邦金",
+    "2886": "兆豐金",
+    "2891": "中信金",
+    "2884": "玉山金",
+    "2303": "聯電",
+    "2002": "中鋼",
+    "1301": "台塑",
+    "1303": "南亞",
+    "6505": "台塑化",
+    "2382": "廣達",
+    "2357": "華碩",
+    "3008": "大立光",
+    "2327": "國巨",
+    "3711": "日月光投控",
+    "2379": "瑞昱",
+    "2395": "研華",
+    "3034": "聯詠",
+    "2408": "南亞科",
+    "2409": "友達",
+    "2474": "可成",
+    "0050": "元大台灣50",
+    "0056": "元大高股息",
+    "006208": "富邦台50",
+}
+
+def get_stock_name(symbol):
+    """
+    ✅ 取得股票中文名稱
+    
+    參數:
+        symbol: 股票代碼（可含 .TW）
+    
+    返回:
+        tuple: (股票代碼, 股票中文名稱)
+    """
+    # 移除 .TW 後綴
+    clean_symbol = symbol.replace(".TW", "").strip()
+    
+    # 從對應表查詢
+    stock_name = STOCK_NAMES.get(clean_symbol, "")
+    
+    # 返回代碼和名稱的元組
+    if stock_name:
+        return clean_symbol, stock_name
+    else:
+        return clean_symbol, clean_symbol  # 找不到名稱就返回代碼
+
+
+def test_finmind_api(token, symbol="2330"):
+    """
+    測試 FinMind API 連線與數據格式
+    
+    參數:
+        token: FinMind API Token
+        symbol: 測試用股票代碼
+    
+    返回:
+        dict: 測試結果
+    """
+    try:
+        url = "https://api.finmindtrade.com/api/v4/data"
+        
+        params = {
+            "dataset": "TaiwanStockPrice",
+            "data_id": symbol,
+            "start_date": (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"),
+            "end_date": datetime.now().strftime("%Y-%m-%d"),
+            "token": token
+        }
+        
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if data.get("status") == 200 and data.get("data"):
+            df = pd.DataFrame(data["data"])
+            
+            return {
+                "success": True,
+                "message": "API 測試成功",
+                "columns": list(df.columns),
+                "data_count": len(df)
+            }
+        else:
+            return {
+                "success": False,
+                "message": data.get("msg", "未知錯誤"),
+                "columns": [],
+                "data_count": 0
+            }
+            
+    except Exception as e:
+        return {
+            "success": False,
+            "message": str(e),
+            "columns": [],
+            "data_count": 0
+        }
+
+
+def get_stock_data(symbol, start_date, end_date, token, force_update=False):
+    """
+    獲取股票歷史價格數據（支援快取）
+    
+    參數:
+        symbol: 股票代碼
+        start_date: 開始日期 (YYYY-MM-DD)
+        end_date: 結束日期 (YYYY-MM-DD)
+        token: FinMind API Token
+        force_update: 是否強制從 API 更新
+    
+    返回:
+        DataFrame: 股票價格數據
+    """
+    try:
+        db = get_database()
+        clean_symbol = symbol.replace(".TW", "")
+        
+        # 嘗試從快取讀取
+        if not force_update:
+            cached_data = db.get_stock_prices(clean_symbol, start_date, end_date)
+            if cached_data is not None and not cached_data.empty:
+                print(f"✅ 從快取讀取 {clean_symbol} 的價格數據")
+                return cached_data
+        
+        # 從 API 獲取
+        print(f"🌐 從 FinMind API 獲取 {clean_symbol} 的數據...")
+        
+        url = "https://api.finmindtrade.com/api/v4/data"
+        
+        params = {
+            "dataset": "TaiwanStockPrice",
+            "data_id": clean_symbol,
+            "start_date": start_date,
+            "end_date": end_date,
+            "token": token
+        }
+        
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if data.get("status") != 200:
+            print(f"❌ API 返回錯誤: {data.get('msg', '未知錯誤')}")
+            return None
+        
+        if not data.get("data"):
+            print(f"❌ 無數據返回")
+            return None
+        
+        df = pd.DataFrame(data["data"])
+        
+        # ✅ 確保欄位名稱正確
+        df = df.rename(columns={
+            'Trading_Volume': 'volume',
+            'Open': 'open',
+            'High': 'high',
+            'Low': 'low',
+            'Close': 'close',
+            'date': 'date'  # 確保有 date 欄位
+        })
+        
+        # ✅ 確保 date 欄位存在且格式正確
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+        else:
+            print(f"❌ 數據中缺少 date 欄位")
+            return None
+        
+        # 排序並重置索引
+        df = df.sort_values('date').reset_index(drop=True)
+        
+        # 儲存到快取
+        db.save_stock_prices(clean_symbol, df)
+        
+        print(f"✅ 成功獲取 {len(df)} 筆數據")
+        return df
+        
+    except Exception as e:
+        print(f"❌ 獲取股票數據時發生錯誤: {str(e)}")
+        return None
+
+
+def get_institutional_data(symbol, start_date, end_date, token, force_update=False):
+    """
+    獲取三大法人買賣超數據（支援快取）
+    
+    參數:
+        symbol: 股票代碼
+        start_date: 開始日期
+        end_date: 結束日期
+        token: FinMind API Token
+        force_update: 是否強制從 API 更新
+    
+    返回:
+        DataFrame: 法人買賣超數據
+    """
+    try:
+        db = get_database()
+        clean_symbol = symbol.replace(".TW", "")
+        
+        # 嘗試從快取讀取
+        if not force_update:
+            cached_data = db.get_institutional_data(clean_symbol, start_date, end_date)
+            if cached_data is not None and not cached_data.empty:
+                print(f"✅ 從快取讀取 {clean_symbol} 的籌碼數據")
+                return cached_data
+        
+        # 從 API 獲取
+        print(f"🌐 從 FinMind API 獲取 {clean_symbol} 的籌碼數據...")
+        
+        url = "https://api.finmindtrade.com/api/v4/data"
+        
+        params = {
+            "dataset": "TaiwanStockInstitutionalInvestors",
+            "data_id": clean_symbol,
+            "start_date": start_date,
+            "end_date": end_date,
+            "token": token
+        }
+        
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if data.get("status") != 200 or not data.get("data"):
+            print(f"⚠️ 無法獲取籌碼數據")
+            return None
+        
+        df = pd.DataFrame(data["data"])
+        
+        # ✅ 確保 date 欄位存在
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+        
+        # 儲存到快取
+        db.save_institutional_data(clean_symbol, df)
+        
+        print(f"✅ 成功獲取 {len(df)} 筆籌碼數據")
+        return df
+        
+    except Exception as e:
+        print(f"❌ 獲取籌碼數據時發生錯誤: {str(e)}")
+        return None

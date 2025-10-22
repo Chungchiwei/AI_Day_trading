@@ -1,0 +1,594 @@
+"""
+資料庫管理模組 - 使用 SQLite 快取股票數據
+"""
+
+import sqlite3
+import pandas as pd
+from datetime import datetime, timedelta
+import json
+import os
+
+class StockDatabase:
+    """股票資料庫管理類別"""
+    
+    def __init__(self, db_path="stock_data.db"):
+        """
+        初始化資料庫連線
+        
+        參數:
+            db_path: 資料庫檔案路徑
+        """
+        self.db_path = db_path
+        self.conn = None
+        self.cursor = None
+        self._connect()
+        self._create_tables()
+    
+    def _connect(self):
+        """建立資料庫連線"""
+        try:
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.cursor = self.conn.cursor()
+            print(f"✅ 資料庫連線成功: {self.db_path}")
+        except Exception as e:
+            print(f"❌ 資料庫連線失敗: {str(e)}")
+            raise
+    
+    def _create_tables(self):
+        """建立所有必要的資料表"""
+        
+        # 股票價格資料表
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS stock_prices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                date DATE NOT NULL,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                volume REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, date)
+            )
+        """)
+        
+        # 技術指標資料表
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS technical_indicators (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                date DATE NOT NULL,
+                ma5 REAL,
+                ma10 REAL,
+                ma20 REAL,
+                ma60 REAL,
+                rsi REAL,
+                bb_upper REAL,
+                bb_middle REAL,
+                bb_lower REAL,
+                bb_percent REAL,
+                macd_dif REAL,
+                macd_def REAL,
+                macd_histogram REAL,
+                k_value REAL,
+                d_value REAL,
+                atr5 REAL,
+                atr10 REAL,
+                atr20 REAL,
+                vwap REAL,
+                obv REAL,
+                adx REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, date)
+            )
+        """)
+        
+        # 籌碼資料表
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS institutional_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                date DATE NOT NULL,
+                foreign_net REAL,
+                trust_net REAL,
+                dealer_net REAL,
+                margin_balance REAL,
+                short_balance REAL,
+                data_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, date)
+            )
+        """)
+        
+        # 新聞事件快取表
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS news_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                news_content TEXT,
+                fetch_date DATE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, fetch_date)
+            )
+        """)
+        
+        # 查詢記錄表
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS query_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                query_date DATE NOT NULL,
+                data_source TEXT,
+                query_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # 建立索引以提升查詢效能
+        self.cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_symbol_date 
+            ON stock_prices(symbol, date)
+        """)
+        
+        self.cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_indicators_symbol_date 
+            ON technical_indicators(symbol, date)
+        """)
+        
+        self.cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_institutional_symbol_date 
+            ON institutional_data(symbol, date)
+        """)
+        
+        self.conn.commit()
+        print("✅ 資料表建立完成")
+    
+    def check_data_freshness(self, symbol, start_date, end_date):
+        """
+        檢查資料庫中的數據是否為最新
+        
+        參數:
+            symbol: 股票代碼
+            start_date: 開始日期 (YYYY-MM-DD)
+            end_date: 結束日期 (YYYY-MM-DD)
+        
+        返回:
+            dict: {
+                'has_data': bool,           # 是否有資料
+                'is_fresh': bool,           # 是否為最新
+                'missing_dates': list,      # 缺少的日期
+                'latest_date': str,         # 最新日期
+                'need_update': bool         # 是否需要更新
+            }
+        """
+        try:
+            # 查詢資料庫中的日期範圍
+            query = """
+                SELECT MIN(date) as min_date, MAX(date) as max_date, COUNT(*) as count
+                FROM stock_prices
+                WHERE symbol = ? AND date BETWEEN ? AND ?
+            """
+            
+            self.cursor.execute(query, (symbol, start_date, end_date))
+            result = self.cursor.fetchone()
+            
+            if result[2] == 0:  # 沒有資料
+                return {
+                    'has_data': False,
+                    'is_fresh': False,
+                    'missing_dates': [],
+                    'latest_date': None,
+                    'need_update': True,
+                    'reason': '資料庫中無此股票資料'
+                }
+            
+            min_date = result[0]
+            max_date = result[1]
+            count = result[2]
+            
+            # 檢查是否為今天
+            today = datetime.now().date()
+            max_date_obj = datetime.strptime(max_date, '%Y-%m-%d').date()
+            
+            # 如果最新日期不是今天（且今天是交易日），需要更新
+            is_fresh = (max_date_obj == today) or (today.weekday() >= 5)  # 週末不需更新
+            
+            # 檢查日期連續性
+            query_dates = """
+                SELECT date FROM stock_prices
+                WHERE symbol = ? AND date BETWEEN ? AND ?
+                ORDER BY date
+            """
+            self.cursor.execute(query_dates, (symbol, start_date, end_date))
+            existing_dates = [row[0] for row in self.cursor.fetchall()]
+            
+            return {
+                'has_data': True,
+                'is_fresh': is_fresh,
+                'missing_dates': [],
+                'latest_date': max_date,
+                'need_update': not is_fresh,
+                'reason': '資料已是最新' if is_fresh else f'最新日期為 {max_date}，需要更新',
+                'data_count': count
+            }
+            
+        except Exception as e:
+            print(f"❌ 檢查資料新鮮度時發生錯誤: {str(e)}")
+            return {
+                'has_data': False,
+                'is_fresh': False,
+                'missing_dates': [],
+                'latest_date': None,
+                'need_update': True,
+                'reason': f'檢查時發生錯誤: {str(e)}'
+            }
+    
+    def save_stock_data(self, symbol, df):
+        """
+        儲存股票價格數據到資料庫
+        
+        參數:
+            symbol: 股票代碼
+            df: 包含價格數據的 DataFrame
+        
+        返回:
+            bool: 是否成功儲存
+        """
+        try:
+            for _, row in df.iterrows():
+                # 使用 INSERT OR REPLACE 來更新或插入
+                query = """
+                    INSERT OR REPLACE INTO stock_prices 
+                    (symbol, date, open, high, low, close, volume, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """
+                
+                self.cursor.execute(query, (
+                    symbol,
+                    row['date'].strftime('%Y-%m-%d') if isinstance(row['date'], datetime) else row['date'],
+                    float(row['open']),
+                    float(row['high']),
+                    float(row['low']),
+                    float(row['close']),
+                    float(row['volume'])
+                ))
+            
+            self.conn.commit()
+            print(f"✅ 成功儲存 {len(df)} 筆 {symbol} 價格數據")
+            
+            # 記錄查詢日誌
+            self._log_query(symbol, 'database_save')
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ 儲存股票數據時發生錯誤: {str(e)}")
+            self.conn.rollback()
+            return False
+    
+    def get_stock_data(self, symbol, start_date, end_date):
+        """
+        從資料庫讀取股票數據
+        
+        參數:
+            symbol: 股票代碼
+            start_date: 開始日期
+            end_date: 結束日期
+        
+        返回:
+            DataFrame: 股票數據
+        """
+        try:
+            query = """
+                SELECT date, open, high, low, close, volume
+                FROM stock_prices
+                WHERE symbol = ? AND date BETWEEN ? AND ?
+                ORDER BY date ASC
+            """
+            
+            df = pd.read_sql_query(
+                query, 
+                self.conn, 
+                params=(symbol, start_date, end_date),
+                parse_dates=['date']
+            )
+            
+            if not df.empty:
+                print(f"✅ 從資料庫讀取 {len(df)} 筆 {symbol} 數據")
+                self._log_query(symbol, 'database_read')
+            
+            return df
+            
+        except Exception as e:
+            print(f"❌ 讀取股票數據時發生錯誤: {str(e)}")
+            return pd.DataFrame()
+    
+    # ✅ 新增：get_stock_prices 方法（與 get_stock_data 相同功能）
+    def get_stock_prices(self, symbol, start_date, end_date):
+        """
+        從資料庫讀取股票價格數據（別名方法）
+        
+        參數:
+            symbol: 股票代碼
+            start_date: 開始日期
+            end_date: 結束日期
+        
+        返回:
+            DataFrame: 股票數據
+        """
+        return self.get_stock_data(symbol, start_date, end_date)
+    
+    def save_technical_indicators(self, symbol, df):
+        """
+        儲存技術指標到資料庫
+        
+        參數:
+            symbol: 股票代碼
+            df: 包含技術指標的 DataFrame
+        """
+        try:
+            indicator_columns = [
+                'MA5', 'MA10', 'MA20', 'MA60', 'RSI',
+                'BB_upper', 'BB_middle', 'BB_lower', 'BB_percent',
+                'MACD_DIF', 'MACD_DEF', 'MACD',
+                'K', 'D', 'ATR5', 'ATR10', 'ATR20',
+                'VWAP', 'OBV', 'ADX'
+            ]
+            
+            for _, row in df.iterrows():
+                query = """
+                    INSERT OR REPLACE INTO technical_indicators 
+                    (symbol, date, ma5, ma10, ma20, ma60, rsi,
+                     bb_upper, bb_middle, bb_lower, bb_percent,
+                     macd_dif, macd_def, macd_histogram,
+                     k_value, d_value, atr5, atr10, atr20,
+                     vwap, obv, adx, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """
+                
+                values = [symbol, row['date'].strftime('%Y-%m-%d') if isinstance(row['date'], datetime) else row['date']]
+                
+                for col in indicator_columns:
+                    val = row.get(col, None)
+                    values.append(float(val) if pd.notna(val) else None)
+                
+                self.cursor.execute(query, values)
+            
+            self.conn.commit()
+            print(f"✅ 成功儲存 {len(df)} 筆技術指標")
+            return True
+            
+        except Exception as e:
+            print(f"❌ 儲存技術指標時發生錯誤: {str(e)}")
+            self.conn.rollback()
+            return False
+    
+    def get_technical_indicators(self, symbol, start_date, end_date):
+        """從資料庫讀取技術指標"""
+        try:
+            query = """
+                SELECT * FROM technical_indicators
+                WHERE symbol = ? AND date BETWEEN ? AND ?
+                ORDER BY date ASC
+            """
+            
+            df = pd.read_sql_query(
+                query,
+                self.conn,
+                params=(symbol, start_date, end_date),
+                parse_dates=['date']
+            )
+            
+            return df
+            
+        except Exception as e:
+            print(f"❌ 讀取技術指標時發生錯誤: {str(e)}")
+            return pd.DataFrame()
+    
+    def save_institutional_data(self, symbol, institutional_dict):
+        """
+        儲存籌碼數據
+        
+        參數:
+            symbol: 股票代碼
+            institutional_dict: 籌碼數據字典
+        """
+        try:
+            # 儲存為 JSON 格式
+            data_json = json.dumps({
+                'institutional': institutional_dict.get('institutional', pd.DataFrame()).to_dict('records'),
+                'margin': institutional_dict.get('margin', pd.DataFrame()).to_dict('records')
+            }, ensure_ascii=False)
+            
+            query = """
+                INSERT OR REPLACE INTO institutional_data
+                (symbol, date, data_json, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            """
+            
+            today = datetime.now().strftime('%Y-%m-%d')
+            self.cursor.execute(query, (symbol, today, data_json))
+            self.conn.commit()
+            
+            print(f"✅ 成功儲存籌碼數據")
+            return True
+            
+        except Exception as e:
+            print(f"❌ 儲存籌碼數據時發生錯誤: {str(e)}")
+            return False
+    
+    def get_institutional_data(self, symbol, date=None):
+        """讀取籌碼數據"""
+        try:
+            if date is None:
+                date = datetime.now().strftime('%Y-%m-%d')
+            
+            query = """
+                SELECT data_json FROM institutional_data
+                WHERE symbol = ? AND date = ?
+            """
+            
+            self.cursor.execute(query, (symbol, date))
+            result = self.cursor.fetchone()
+            
+            if result:
+                data = json.loads(result[0])
+                return {
+                    'institutional': pd.DataFrame(data.get('institutional', [])),
+                    'margin': pd.DataFrame(data.get('margin', []))
+                }
+            
+            return None
+            
+        except Exception as e:
+            print(f"❌ 讀取籌碼數據時發生錯誤: {str(e)}")
+            return None
+    
+    def save_news_cache(self, symbol, news_content):
+        """儲存新聞快取"""
+        try:
+            today = datetime.now().strftime('%Y-%m-%d')
+            
+            query = """
+                INSERT OR REPLACE INTO news_cache
+                (symbol, news_content, fetch_date)
+                VALUES (?, ?, ?)
+            """
+            
+            self.cursor.execute(query, (symbol, news_content, today))
+            self.conn.commit()
+            
+            print(f"✅ 成功儲存新聞快取")
+            return True
+            
+        except Exception as e:
+            print(f"❌ 儲存新聞快取時發生錯誤: {str(e)}")
+            return False
+    
+    def get_news_cache(self, symbol):
+        """讀取新聞快取（當日）"""
+        try:
+            today = datetime.now().strftime('%Y-%m-%d')
+            
+            query = """
+                SELECT news_content FROM news_cache
+                WHERE symbol = ? AND fetch_date = ?
+            """
+            
+            self.cursor.execute(query, (symbol, today))
+            result = self.cursor.fetchone()
+            
+            if result:
+                print(f"✅ 從快取讀取新聞")
+                return result[0]
+            
+            return None
+            
+        except Exception as e:
+            print(f"❌ 讀取新聞快取時發生錯誤: {str(e)}")
+            return None
+    
+    def _log_query(self, symbol, data_source):
+        """記錄查詢日誌"""
+        try:
+            query = """
+                INSERT INTO query_log (symbol, query_date, data_source)
+                VALUES (?, ?, ?)
+            """
+            
+            today = datetime.now().strftime('%Y-%m-%d')
+            self.cursor.execute(query, (symbol, today, data_source))
+            self.conn.commit()
+            
+        except Exception as e:
+            print(f"記錄查詢日誌時發生錯誤: {str(e)}")
+    
+    def get_query_statistics(self, symbol=None, days=30):
+        """
+        獲取查詢統計
+        
+        參數:
+            symbol: 股票代碼（None 表示全部）
+            days: 統計天數
+        
+        返回:
+            DataFrame: 統計數據
+        """
+        try:
+            start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+            
+            if symbol:
+                query = """
+                    SELECT 
+                        symbol,
+                        data_source,
+                        COUNT(*) as query_count,
+                        MAX(query_time) as last_query
+                    FROM query_log
+                    WHERE symbol = ? AND query_date >= ?
+                    GROUP BY symbol, data_source
+                    ORDER BY query_count DESC
+                """
+                params = (symbol, start_date)
+            else:
+                query = """
+                    SELECT 
+                        symbol,
+                        data_source,
+                        COUNT(*) as query_count,
+                        MAX(query_time) as last_query
+                    FROM query_log
+                    WHERE query_date >= ?
+                    GROUP BY symbol, data_source
+                    ORDER BY query_count DESC
+                """
+                params = (start_date,)
+            
+            df = pd.read_sql_query(query, self.conn, params=params)
+            return df
+            
+        except Exception as e:
+            print(f"❌ 獲取統計數據時發生錯誤: {str(e)}")
+            return pd.DataFrame()
+    
+    def cleanup_old_data(self, days=90):
+        """
+        清理舊數據
+        
+        參數:
+            days: 保留天數
+        """
+        try:
+            cutoff_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+            
+            tables = ['stock_prices', 'technical_indicators', 'institutional_data', 'news_cache']
+            
+            for table in tables:
+                query = f"DELETE FROM {table} WHERE date < ?"
+                self.cursor.execute(query, (cutoff_date,))
+            
+            self.conn.commit()
+            print(f"✅ 已清理 {days} 天前的舊數據")
+            
+        except Exception as e:
+            print(f"❌ 清理舊數據時發生錯誤: {str(e)}")
+    
+    def close(self):
+        """關閉資料庫連線"""
+        if self.conn:
+            self.conn.close()
+            print("✅ 資料庫連線已關閉")
+
+
+# 全域資料庫實例
+_db_instance = None
+
+def get_database():
+    """獲取資料庫實例（單例模式）"""
+    global _db_instance
+    if _db_instance is None:
+        _db_instance = StockDatabase()
+    return _db_instance

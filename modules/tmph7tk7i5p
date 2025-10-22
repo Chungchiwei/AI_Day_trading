@@ -1,0 +1,595 @@
+"""
+AI 分析模組 - 使用 Perplexity.ai 進行當沖分析
+優化版：分層任務處理、減少 Token 消耗
+"""
+import os
+import requests
+import json
+import time
+from typing import Optional, Dict, List, Literal
+import pandas as pd
+from modules.database import get_database
+from dotenv import load_dotenv
+load_dotenv()
+
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
+
+class DayTradingAnalyzer:
+    """當沖 AI 分析器 - 優化版"""
+    
+    # 模型配置（按成本和用途分層）
+    MODEL_CONFIG = {
+        'news_search': {
+            'model': 'llama-3.1-sonar-small-128k-online',  # 新聞搜尋用小模型
+            'max_tokens': 800,
+            'temperature': 0.2,
+            'description': '新聞搜尋與初篩'
+        },
+        'news_summary': {
+            'model': 'llama-3.1-sonar-small-128k-online',  # 新聞摘要用小模型
+            'max_tokens': 500,
+            'temperature': 0.1,
+            'description': '新聞摘要與結構化'
+        },
+        'technical_analysis': {
+            'model': 'llama-3.1-sonar-small-128k-chat',  # 純技術分析不需要聯網
+            'max_tokens': 1500,
+            'temperature': 0.3,
+            'description': '技術面分析'
+        },
+        'comprehensive_analysis': {
+            'model': 'sonar-reasoning',  # 綜合分析用推理模型
+            'max_tokens': 2000,
+            'temperature': 0.3,
+            'description': '綜合分析與決策'
+        },
+        'deep_research': {
+            'model': 'sonar-deep-research',  # 深度研究（限量使用）
+            'max_tokens': 3000,
+            'temperature': 0.2,
+            'description': '深度研究（重大事件）'
+        }
+    }
+    
+    # 新聞來源白名單（台灣主要財經媒體）
+    TRUSTED_DOMAINS = [
+        'cnyes.com',           # 鉅亨網
+        'money.udn.com',       # 經濟日報
+        'ctee.com.tw',         # 工商時報
+        'wealth.com.tw',       # 財訊
+        'businessweekly.com.tw', # 商業周刊
+        'cw.com.tw',           # 天下雜誌
+        'mops.twse.com.tw',    # 公開資訊觀測站
+        'twse.com.tw'          # 證交所
+    ]
+    
+    def __init__(self, api_key: str):
+        """
+        初始化分析器
+        
+        Args:
+            api_key: Perplexity API Key
+        """
+        self.api_key = api_key or PERPLEXITY_API_KEY
+        self.base_url = "https://api.perplexity.ai/chat/completions"
+        self.db = get_database()
+        
+        if not self.api_key:
+            raise ValueError("❌ PERPLEXITY_API_KEY 未設定")
+        
+        # 統計 Token 使用量
+        self.token_usage = {
+            'prompt_tokens': 0,
+            'completion_tokens': 0,
+            'total_tokens': 0
+        }
+    
+    def _call_api(self, messages: List[Dict], task_type: str = 'technical_analysis',
+                  search_domain_filter: Optional[List[str]] = None,
+                  max_retries: int = 2) -> Optional[Dict]:
+        """
+        呼叫 Perplexity API（優化版，支援任務分層）
+        
+        Args:
+            messages: 對話訊息列表
+            task_type: 任務類型（決定使用哪個模型）
+            search_domain_filter: 搜尋域名過濾器
+            max_retries: 最大重試次數
+            
+        Returns:
+            包含回應和 token 使用量的字典
+        """
+        # 獲取模型配置
+        config = self.MODEL_CONFIG.get(task_type, self.MODEL_CONFIG['technical_analysis'])
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": config['model'],
+            "messages": messages,
+            "temperature": config['temperature'],
+            "max_tokens": config['max_tokens']
+        }
+        
+        # 添加搜尋域名過濾（僅限 online 模型）
+        if search_domain_filter and 'online' in config['model']:
+            payload['search_domain_filter'] = search_domain_filter
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"   📡 API 請求 [{config['description']}] (嘗試 {attempt + 1}/{max_retries})")
+                print(f"   🤖 使用模型: {config['model']}")
+                
+                response = requests.post(
+                    self.base_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=120
+                )
+                
+                response.raise_for_status()
+                result = response.json()
+                
+                # 記錄 Token 使用量
+                if 'usage' in result:
+                    usage = result['usage']
+                    self.token_usage['prompt_tokens'] += usage.get('prompt_tokens', 0)
+                    self.token_usage['completion_tokens'] += usage.get('completion_tokens', 0)
+                    self.token_usage['total_tokens'] += usage.get('total_tokens', 0)
+                    
+                    print(f"   💰 Token 使用: {usage.get('total_tokens', 0)} "
+                          f"(Prompt: {usage.get('prompt_tokens', 0)}, "
+                          f"Completion: {usage.get('completion_tokens', 0)})")
+                
+                return {
+                    'content': result['choices'][0]['message']['content'],
+                    'usage': result.get('usage', {}),
+                    'model': config['model']
+                }
+                
+            except requests.exceptions.Timeout:
+                print(f"⚠️ 請求超時 (嘗試 {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+                    
+            except requests.exceptions.RequestException as e:
+                print(f"❌ API 請求失敗: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(3)
+                    
+            except Exception as e:
+                print(f"❌ 未知錯誤: {e}")
+                break
+        
+        return None
+    
+    def search_news_events(self, symbol: str, force_update: bool = False,
+                          use_deep_research: bool = False) -> Dict:
+        """
+        搜尋股票近期新聞事件（優化版：分兩階段處理）
+        
+        Args:
+            symbol: 股票代碼
+            force_update: 是否強制更新
+            use_deep_research: 是否使用深度研究模型（重大事件時）
+            
+        Returns:
+            dict: 包含新聞內容和元數據的字典
+        """
+        try:
+            # 嘗試從快取讀取
+            if not force_update:
+                cached_news = self.db.get_news_cache(symbol)
+                if cached_news:
+                    print(f"✅ 從快取讀取 {symbol} 的新聞")
+                    return {
+                        'content': cached_news,
+                        'is_fallback': False,
+                        'source': 'cache',
+                        'model': 'cache'
+                    }
+            
+            print(f"🔍 階段 1: 搜尋 {symbol} 的新聞事件...")
+            
+            # 階段 1: 使用小模型搜尋和初篩
+            search_messages = [
+                {
+                    "role": "system",
+                    "content": "你是台股新聞搜尋助手。請搜尋並列出最重要的新聞標題和來源，用繁體中文。"
+                },
+                {
+                    "role": "user",
+                    "content": f"""搜尋台股 {symbol} 最近 7 天的重要新聞，只列出：
+
+1. 標題
+2. 日期
+3. 來源網站
+
+格式：
+- [日期] 標題 (來源)
+
+只列出最重要的 3-5 則，不要詳細內容。"""
+                }
+            ]
+            
+            # 使用小模型 + 域名過濾
+            search_result = self._call_api(
+                search_messages,
+                task_type='news_search',
+                search_domain_filter=self.TRUSTED_DOMAINS
+            )
+            
+            if not search_result:
+                return self._get_fallback_news(symbol)
+            
+            raw_news = search_result['content']
+            
+            # 檢查是否有重大新聞（關鍵字判斷）
+            important_keywords = ['財報', '併購', '重訊', '法說', '增資', '減資', '停牌']
+            has_important_event = any(keyword in raw_news for keyword in important_keywords)
+            
+            # 階段 2: 根據重要性選擇模型進行摘要
+            print(f"📝 階段 2: 生成新聞摘要...")
+            
+            task_type = 'deep_research' if (use_deep_research and has_important_event) else 'news_summary'
+            
+            if has_important_event:
+                print(f"   ⚠️ 偵測到重大事件，使用{'深度研究' if use_deep_research else '標準'}模型")
+            
+            summary_messages = [
+                {
+                    "role": "system",
+                    "content": "你是台股新聞分析專家。請將新聞整理成結構化格式，用繁體中文。"
+                },
+                {
+                    "role": "user",
+                    "content": f"""請將以下 {symbol} 的新聞整理成：
+
+{raw_news}
+
+---
+輸出格式：
+
+## 📰 重要新聞 ({symbol})
+
+### [日期] 標題
+- **類型**: 財報/併購/產業/其他
+- **影響**: 正面/負面/中性
+- **重點**: 一句話說明
+
+---
+只保留最重要的 2-3 則，每則不超過 50 字。"""
+                }
+            ]
+            
+            summary_result = self._call_api(
+                summary_messages,
+                task_type=task_type
+            )
+            
+            if summary_result:
+                news_content = summary_result['content']
+                
+                # 儲存到快取
+                self.db.save_news_cache(symbol, news_content)
+                
+                print(f"✅ 新聞分析完成 (使用模型: {summary_result['model']})")
+                
+                return {
+                    'content': news_content,
+                    'is_fallback': False,
+                    'source': 'api',
+                    'model': summary_result['model'],
+                    'has_important_event': has_important_event
+                }
+            else:
+                return self._get_fallback_news(symbol)
+            
+        except Exception as e:
+            print(f"❌ 搜尋新聞事件時發生錯誤: {str(e)}")
+            return self._get_fallback_news(symbol)
+    
+    def _get_fallback_news(self, symbol: str) -> Dict:
+        """備用新聞訊息"""
+        return {
+            'content': f"""
+## ⚠️ 新聞搜尋暫時無法使用
+
+由於網路連線問題，目前無法獲取 {symbol} 的最新新聞。
+
+### 建議替代方案：
+1. 手動查詢：[鉅亨網](https://news.cnyes.com/) 搜尋「{symbol}」
+2. 參考技術面分析（本系統仍可用）
+3. 稍後勾選「強制更新」重試
+
+---
+**提示**: 當沖交易建議以技術面為主
+""",
+            'is_fallback': True,
+            'source': 'fallback',
+            'model': 'none'
+        }
+    
+    def generate_daytrading_analysis(self, symbol: str, stock_data: pd.DataFrame, 
+                                    today_open: float, yesterday_close: float,
+                                    support_resistance: Dict, 
+                                    institutional_data: Optional[pd.DataFrame] = None,
+                                    news_events: Optional[Dict] = None,
+                                    **kwargs) -> str:
+        """
+        生成完整的當沖決策分析（優化版：分層處理）
+        
+        Args:
+            symbol: 股票代碼
+            stock_data: 包含技術指標的歷史價格數據
+            today_open: 當日開盤價
+            yesterday_close: 昨日收盤價
+            support_resistance: 支撐壓力位字典
+            institutional_data: 籌碼數據 (可選)
+            news_events: 新聞事件字典 (可選)
+            **kwargs: 其他參數
+            
+        Returns:
+            AI 生成的當沖分析報告
+        """
+        try:
+            # 重置 Token 計數
+            self.token_usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
+            
+            # 從 kwargs 取得參數
+            fee_discount = kwargs.get('fee_discount', 2.8)
+            tax_rate = kwargs.get('tax_rate', 0.15)
+            total_capital = kwargs.get('total_capital', 100000)
+            risk_percent = kwargs.get('risk_percent', 1.0)
+            
+            # 準備基本數據（精簡版）
+            gap_amount = today_open - yesterday_close
+            gap_percent = (gap_amount / yesterday_close) * 100
+            
+            latest = stock_data.iloc[-1]
+            
+            # 只保留關鍵技術指標（減少 Token）
+            key_indicators = {
+                'close': float(latest.get('close', 0)),
+                'MA5': float(latest.get('MA5', 0)),
+                'MA20': float(latest.get('MA20', 0)),
+                'RSI': float(latest.get('RSI', 0)),
+                'MACD': float(latest.get('MACD', 0)),
+                'KD_K': float(latest.get('KD_K', 0)),
+                'volume_ratio': float(latest.get('volume', 0)) / stock_data['volume'].mean()
+            }
+            
+            # 精簡支撐壓力位（只取最近的 2 個）
+            resistance_list = support_resistance.get('resistance', [])[:2]
+            support_list = support_resistance.get('support', [])[:2]
+            
+            resistance_text = " / ".join([f"NT$ {r['price']:.2f}" for r in resistance_list])
+            support_text = " / ".join([f"NT$ {s['price']:.2f}" for s in support_list])
+            
+            # 處理新聞（精簡版）
+            has_news = news_events is not None and not news_events.get('is_fallback', True)
+            news_summary = ""
+            
+            if has_news:
+                news_content = news_events.get('content', '')
+                # 只取新聞的前 300 字
+                news_summary = news_content[:300] + "..." if len(news_content) > 300 else news_content
+            
+            # 精簡籌碼數據
+            institutional_summary = ""
+            if institutional_data is not None and not institutional_data.empty:
+                latest_inst = institutional_data.iloc[-1]
+                foreign = latest_inst.get('Foreign_Investor', 0)
+                trust = latest_inst.get('Investment_Trust', 0)
+                
+                # 只報告重要的籌碼動向
+                if abs(foreign) > 1000 or abs(trust) > 500:
+                    institutional_summary = f"外資 {foreign:+,.0f}張, 投信 {trust:+,.0f}張"
+            
+            # 決定使用哪個模型
+            has_important_event = news_events.get('has_important_event', False) if has_news else False
+            task_type = 'comprehensive_analysis' if has_news else 'technical_analysis'
+            
+            # 構建精簡提示詞
+            system_message = "你是台股當沖分析專家。請基於數據給出明確的交易建議，用繁體中文，格式簡潔。"
+            
+            user_prompt = f"""分析 {symbol} 當沖機會：
+
+**價格**: 昨收 {yesterday_close:.2f} → 今開 {today_open:.2f} ({gap_percent:+.2f}%)
+
+**技術**: RSI {key_indicators['RSI']:.0f}, MACD {key_indicators['MACD']:.2f}, KD {key_indicators['KD_K']:.0f}
+MA5 {key_indicators['MA5']:.2f} / MA20 {key_indicators['MA20']:.2f}
+
+**關鍵價位**: 
+壓力 {resistance_text} | 支撐 {support_text}
+"""
+
+            if institutional_summary:
+                user_prompt += f"\n**籌碼**: {institutional_summary}"
+            
+            if has_news and news_summary:
+                user_prompt += f"\n\n**新聞**: {news_summary}"
+            
+            user_prompt += f"""
+
+**參數**: 資金 {total_capital:,}, 風險 {risk_percent}%, 手續費 {fee_discount}折
+
+---
+請提供（簡潔版）：
+1. 適合度: ✅適合 / ⚠️謹慎 / ❌不建議
+2. 進場價: NT$ [價格]
+3. 停利價: NT$ [價格] (+X%)
+4. 停損價: NT$ [價格] (-X%)
+5. 建議張數: [數字]張
+6. 風險提示: [一句話]
+
+請直接給數字，不要冗長說明。"""
+
+            messages = [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_prompt}
+            ]
+            
+            print(f"🤖 生成當沖分析 ({'含新聞' if has_news else '純技術'})...")
+            
+            # 調用 API
+            result = self._call_api(messages, task_type=task_type)
+            
+            if result:
+                analysis = result['content']
+                
+                # 添加模式標籤和 Token 使用統計
+                mode_tag = f"""## {'📊 綜合分析' if has_news else '⚡ 技術分析'}模式
+
+**使用模型**: {result['model']}
+**Token 消耗**: {self.token_usage['total_tokens']} 
+(Prompt: {self.token_usage['prompt_tokens']}, Completion: {self.token_usage['completion_tokens']})
+
+---
+
+"""
+                
+                print(f"✅ 分析完成 (總 Token: {self.token_usage['total_tokens']})")
+                
+                return mode_tag + analysis
+            else:
+                return self._get_fallback_analysis(symbol, today_open, yesterday_close, latest)
+            
+        except Exception as e:
+            print(f"❌ AI 分析時發生錯誤: {str(e)}")
+            import traceback
+            print(traceback.format_exc())
+            
+            return f"""
+## ❌ AI 分析失敗
+
+錯誤訊息: {str(e)}
+
+### 建議：
+1. 檢查 API Key 是否正確
+2. 確認網路連線
+3. 參考技術指標手動分析
+
+---
+您仍可使用系統的技術分析功能。
+"""
+    
+    def _get_fallback_analysis(self, symbol: str, today_open: float, 
+                               yesterday_close: float, latest_data: pd.Series) -> str:
+        """備用分析"""
+        gap_percent = ((today_open - yesterday_close) / yesterday_close) * 100
+        
+        return f"""
+## ⚠️ AI 分析暫時無法使用
+
+### 基本技術分析 ({symbol})
+
+- 昨收: NT$ {yesterday_close:.2f}
+- 今開: NT$ {today_open:.2f} ({gap_percent:+.2f}%)
+- RSI: {latest_data.get('RSI', 0):.2f}
+- MA5: NT$ {latest_data.get('MA5', 0):.2f}
+- KD_K: {latest_data.get('KD_K', 0):.2f}
+
+### 建議
+1. 參考 K 線圖判斷趨勢
+2. 注意支撐壓力位
+3. 嚴格執行停損
+
+⚠️ 當沖風險高，請謹慎操作
+"""
+    
+    def get_token_usage_summary(self) -> Dict:
+        """獲取 Token 使用統計"""
+        return self.token_usage.copy()
+
+
+# 向後兼容的函數接口
+def search_news_events(symbol: str, api_key: str, force_update: bool = False,
+                      use_deep_research: bool = False) -> Dict:
+    """向後兼容的新聞搜尋函數"""
+    try:
+        analyzer = DayTradingAnalyzer(api_key)
+        return analyzer.search_news_events(symbol, force_update, use_deep_research)
+    except Exception as e:
+        print(f"❌ 新聞搜尋錯誤: {e}")
+        return DayTradingAnalyzer(api_key)._get_fallback_news(symbol)
+
+
+def generate_daytrading_analysis(symbol: str, stock_data: pd.DataFrame, 
+                                 today_open: float, yesterday_close: float,
+                                 support_resistance: Dict, 
+                                 institutional_data: Optional[pd.DataFrame] = None,
+                                 news_events: Optional[Dict] = None,
+                                 api_key: Optional[str] = None,
+                                 **kwargs) -> str:
+    """向後兼容的分析生成函數"""
+    try:
+        if not api_key:
+            return """
+## ⚠️ AI 分析功能未啟用
+
+請設定 `PERPLEXITY_API_KEY` 環境變數。
+
+### 替代方案：
+1. 參考技術指標
+2. 參考支撐壓力位
+3. 手動決策
+
+---
+**提示**: 系統的技術分析功能仍可使用
+"""
+        
+        analyzer = DayTradingAnalyzer(api_key)
+        result = analyzer.generate_daytrading_analysis(
+            symbol, stock_data, today_open, yesterday_close,
+            support_resistance, institutional_data, news_events, **kwargs
+        )
+        
+        # 顯示 Token 使用統計
+        usage = analyzer.get_token_usage_summary()
+        print(f"\n💰 本次分析 Token 總消耗: {usage['total_tokens']}")
+        
+        return result
+        
+    except Exception as e:
+        print(f"❌ 分析生成錯誤: {e}")
+        return f"❌ 分析失敗: {str(e)}"
+
+
+if __name__ == "__main__":
+    # 測試
+    api_key = os.getenv("PERPLEXITY_API_KEY")
+    
+    if api_key:
+        try:
+            analyzer = DayTradingAnalyzer(api_key)
+            
+            print("=" * 60)
+            print("🧪 測試 AI 分析模組（優化版）")
+            print("=" * 60)
+            
+            # 測試新聞搜尋
+            print("\n1️⃣ 測試新聞搜尋...")
+            news = analyzer.search_news_events("2330", force_update=True)
+            print(f"   來源: {news['source']}")
+            print(f"   模型: {news.get('model', 'N/A')}")
+            print(f"   內容預覽: {news['content'][:150]}...")
+            
+            # 顯示 Token 使用
+            usage = analyzer.get_token_usage_summary()
+            print(f"\n💰 Token 使用統計:")
+            print(f"   Prompt: {usage['prompt_tokens']}")
+            print(f"   Completion: {usage['completion_tokens']}")
+            print(f"   Total: {usage['total_tokens']}")
+            
+            print("\n✅ 測試完成")
+            
+        except Exception as e:
+            print(f"❌ 測試失敗: {e}")
+            import traceback
+            print(traceback.format_exc())
+    else:
+        print("❌ 請設定 PERPLEXITY_API_KEY 環境變數")
